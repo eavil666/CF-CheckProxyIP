@@ -29,9 +29,11 @@ jobs:
           pip install geoip2 pandas requests tqdm
 
       - name: Step 1 - Build Ultimate ASN Database
+        timeout-minutes: 20
         run: python 1_database_builder.py
 
       - name: Step 2 - Run Asia Multi-Port Scanner
+        timeout-minutes: 30
         run: python 2_proxy_scanner.py
 
       - name: Commit & Push Results
