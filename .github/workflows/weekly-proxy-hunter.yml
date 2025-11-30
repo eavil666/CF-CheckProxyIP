@@ -1,0 +1,59 @@
+# .github/workflows/weekly-proxy-hunter.yml
+name: Weekly Asia ProxyIP Hunter
+
+on:
+  schedule:
+    - cron: '0 4 * * 0'        # 每周日 UTC 04:00（北京时间中午12点，比数据库晚1小时）
+  workflow_dispatch:           # 支持手动一键触发
+
+jobs:
+  full-pipeline:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install Dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install geoip2 pandas requests tqdm
+
+      - name: Step 1 - Build Ultimate ASN Database
+        run: python 1_database_builder.py
+
+      - name: Step 2 - Run Asia Multi-Port Scanner
+        run: python 2_proxy_scanner.py
+
+      - name: Commit & Push Results
+        run: |
+          git config user.name "GitHub Action Hunter"
+          git config user.email "action@github.com"
+          
+          git add data/ultimate_asn.db proxyip_asia_final.txt
+          
+          if git diff --quiet --staged; then
+            echo "没有新 ProxyIP，本周收手"
+          else
+            NEW_COUNT=$(git diff --staged proxyip_asia_final.txt | grep "^+" | wc -l)
+            git commit -m "New Asia ProxyIP +$((NEW_COUNT-1)) - $(date +'%Y-%m-%d')"
+            git push
+            echo "已提交 $((NEW_COUNT-1)) 条新极品！"
+          fi
+
+      - name: Telegram Notify (可选)
+        if: always()
+        run: |
+          curl -s -X POST https://api.telegram.org/bot${{ secrets.TG_BOT_TOKEN }}/sendMessage \
+            -d chat_id=${{ secrets.TG_CHAT_ID }} \
+            -d parse_mode=HTML \
+            -d text="ProxyIP 狩猎完成！<b>$(git diff --shortstat HEAD~1..HEAD proxyip_asia_final.txt || echo '无新增')</b>%0A$(date)"
