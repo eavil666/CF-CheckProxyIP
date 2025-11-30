@@ -1,0 +1,43 @@
+# .github/workflows/update-asn-db.yml
+name: Weekly Update ASN Database
+
+on:
+  schedule:
+    - cron: '0 3 * * 0'    # 每周日 UTC 03:00（北京时间上午11点）
+  workflow_dispatch:       # 支持手动触发
+
+jobs:
+  build-and-commit:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write    # 允许提交
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install geoip2 pandas requests tqdm
+
+      - name: Build Ultimate ASN Database
+        run: python 1_database_builder.py
+
+      - name: Commit & Push if changed
+        run: |
+          git config --local user.email "action@github.com"
+          git config --local user.name "GitHub Action"
+          git add data/ultimate_asn.db
+          if git diff --quiet --staged; then
+            echo "无变化，跳过提交"
+          else
+            git commit -m "Auto update ultimate_asn.db - $(date +'%Y-%m-%d %H:%M') UTC"
+            git push
+            echo "已自动提交新数据库！"
+          fi
