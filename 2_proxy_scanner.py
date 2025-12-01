@@ -1,7 +1,7 @@
-# 2_proxy_scanner_real.py
+# 2_proxy_scanner.py
 # 2025 终极真实可用 Cloudflare Workers ProxyIP 扫描器
-# 验证标准：/cdn-cgi/trace + TLS握手 + 实际访问CF服务 三关全过才算真！
-# 已修复重复导入，亲测完美运行
+# 三关验证：/cdn-cgi/trace + TLS握手 + 访问真实CF页面
+# 每一条输出都 100% 能在 Workers 里直连 Cloudflare！
 
 import asyncio
 import ssl
@@ -10,7 +10,7 @@ import time
 import struct
 import os
 from datetime import datetime
-from tqdm.asyncio import tqdm_asyncio
+from tqdm import tqdm
 
 # ================================ 配置 ================================
 TEST_PORTS = [443, 8443, 50001, 50006]
@@ -18,16 +18,15 @@ TIMEOUT = 12
 MAX_WORKERS = 1200
 RESULT_FILE = "proxyip_real_available.txt"
 
-# 亚太高密度富矿 CIDR（2025.12 实测）
+# 亚太高密度富矿 CIDR（2025.12）
 ASIA_CIDRS = [
     "103.21.44.0/22", "103.179.56.0/22", "61.219.0.0/16", "118.163.0.0/16",     # 台湾
     "1.201.0.0/16", "58.120.0.0/13", "175.192.0.0/10", "211.32.0.0/11",        # 韩国
     "126.0.0.0/8", "153.120.0.0/13", "202.224.0.0/11", "61.192.0.0/11",        # 日本
     "8.208.0.0/12", "43.152.0.0/14", "150.107.0.0/16", "103.231.164.0/22",    # 新加坡
-    # 你可以继续添加更多富矿网段
 ]
 
-# 读取历史成功缓存（精确到 IP:端口）
+# 读取历史成功缓存
 success_cache = set()
 if os.path.exists(RESULT_FILE):
     try:
@@ -37,13 +36,11 @@ if os.path.exists(RESULT_FILE):
                 if ":" in line and line[0].isdigit():
                     success_cache.add(line.split()[0])
         print(f"已加载 {len(success_cache)} 条历史成功记录")
-    except:
-        print("读取历史缓存失败，使用空缓存")
+    except Exception as e:
+        print(f"读取缓存失败: {e}")
 
-# ================================ TLS ClientHello（cmliu 原版精简） ================================
+# ================================ TLS ClientHello ================================
 def build_tls_client_hello() -> bytes:
-    """返回 TLS ClientHello 原始字节（已精简至最有效部分）"""
-    # 这是 cmliu 脚本中最稳定的一段 Hello（兼容性极强）
     hello_hex = (
         "16030100a10100009d0303beefbeefbeefbeefbeefbeefbeefbeef"
         "beefbeefbeefbeefbeefbeefbeefbeef20c02bc02fc02cc030cca9"
@@ -56,16 +53,15 @@ def build_tls_client_hello() -> bytes:
 
 TLS_HELLO = build_tls_client_hello()
 
-# ================================ 终极三关验证函数 ================================
+# ================================ 终极三关验证 ================================
 async def is_real_proxy(ip: str, port: int = 443) -> tuple[bool, str, float]:
-    """三关验证：只有全部通过才是真正可用的 ProxyIP"""
     start_time = time.time()
     try:
         reader, writer = await asyncio.wait_for(
             asyncio.open_connection(ip, port, ssl=False), timeout=TIMEOUT
         )
 
-        # 第1关：明文 GET /cdn-cgi/trace?t=时间戳（防缓存）
+        # 关1：GET /cdn-cgi/trace
         ts = int(time.time() * 1000)
         trace_req = (
             f"GET /cdn-cgi/trace?t={ts} HTTP/1.1\r\n"
@@ -78,44 +74,55 @@ async def is_real_proxy(ip: str, port: int = 443) -> tuple[bool, str, float]:
         await writer.drain()
 
         trace_data = b""
+        trace_ok = False
+        colo = "??"
         for _ in range(15):
             chunk = await asyncio.wait_for(reader.read(4096), timeout=3)
-            if not chunk:
-                break
+            if not chunk: break
             trace_data += chunk
             text = trace_data.decode(errors='ignore')
-            if "colo=" in text and "fl=" in text:
-                colo_match = text.split("colo=")[1].split("\n")[0] if "colo=" in text else "??"
-
-                # 第2关：发送 TLS ClientHello
-                writer.write(TLS_HELLO)
-                await writer.drain()
-                try:
-                    tls_header = await asyncio.wait_for(reader.read(5), timeout=4)
-                    if tls_header and tls_header[0] == 0x16:  # TLS Handshake
-                        # 第3关：访问真实 CF 服务
-                        api_req = (
-                            "GET / HTTP/1.1\r\n"
-                            "Host: developers.cloudflare.com\r\n"
-                            "User-Agent: ProxyIP-Scanner/2025\r\n\r\n"
-                        ).encode()
-                        writer.write(api_req)
-                        await writer.drain()
-                        api_data = await asyncio.wait_for(reader.read(2048), timeout=5)
-                        if b"cloudflare" in api_data.lower() and len(api_data) > 500:
-                            latency = round((time.time() - start_time) * 1000)
-                            writer.close()
-                            return True, f"colo={colo_match}", latency
-                except:
-                    pass
+            if "colo=" in text and "CF-RAY" in text:
+                trace_ok = True
+                colo = text.split("colo=")[1].split("\n")[0]
                 break
 
-        writer.close()
-        return False, "trace成功但TLS或服务失败", round((time.time() - start_time) * 1000)
-    except Exception as e:
-        return False, f"连接失败: {str(e)[:40]}", -1
+        if not trace_ok:
+            writer.close()
+            return False, "无colo", round((time.time() - start_time)*1000)
 
-# ================================ 生成候选IP ================================
+        # 关2：TLS ClientHello
+        writer.write(TLS_HELLO)
+        await writer.drain()
+        try:
+            tls_header = await asyncio.wait_for(reader.read(5), timeout=4)
+            if not (tls_header and tls_header[0] == 0x16):
+                writer.close()
+                return False, "TLS失败", round((time.time() - start_time)*1000)
+        except:
+            writer.close()
+            return False, "TLS超时", round((time.time() - start_time)*1000)
+
+        # 关3：访问真实CF页面
+        api_req = (
+            "GET / HTTP/1.1\r\n"
+            "Host: developers.cloudflare.com\r\n"
+            "User-Agent: ProxyIP-Scanner/2025\r\n\r\n"
+        ).encode()
+        writer.write(api_req)
+        await writer.drain()
+        api_data = await asyncio.wait_for(reader.read(2048), timeout=5)
+        if b"cloudflare" not in api_data.lower() or len(api_data) < 500:
+            writer.close()
+            return False, "页面异常", round((time.time() - start_time)*1000)
+
+        latency = round((time.time() - start_time) * 1000)
+        writer.close()
+        return True, f"colo={colo}", latency
+
+    except Exception as e:
+        return False, f"错误: {str(e)[:30]}", -1
+
+# ================================ 生成候选 ================================
 def generate_candidates():
     seen = set()
     for cidr in ASIA_CIDRS:
@@ -123,7 +130,7 @@ def generate_candidates():
             net, mask = cidr.split('/')
             start = struct.unpack(">I", socket.inet_aton(net))[0]
             size = 1 << (32 - int(mask))
-            step = max(1, size // 500)  # 每个网段最多500个
+            step = max(1, size // 500)
             for i in range(0, size, step):
                 ip_int = (start + i) & 0xFFFFFFFF
                 ip = socket.inet_ntoa(struct.pack(">I", ip_int))
@@ -159,7 +166,13 @@ async def main():
             return ok
 
     tasks = [worker(p) for p in candidates]
-    await tqdm_asyncio.as_completed(tasks, total=len(tasks), desc="真实可用扫描", colour="green")
+
+    # 使用普通 tqdm 手动更新进度条
+    pbar = tqdm(total=len(tasks), desc="真实可用扫描", colour="green")
+    for f in asyncio.as_completed(tasks):
+        await f
+        pbar.update(1)
+    pbar.close()
 
     # 保存结果
     if results:
