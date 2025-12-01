@@ -1,6 +1,6 @@
 # 1_database_builder.py
-# 2025 终极稳定版：在 GitHub Actions 上完美运行
-# 已修复所有语法错误 + 字段越界崩溃 + GeoLite2 新版 API 问题
+# 2025 终极双栈 ASN 数据库构建器（支持 IPv4 + IPv6）
+# 自动下载三大源 → 融合 → 输出 ultimate_asn.db（支持 IPv6 查询）
 
 import os
 import struct
@@ -9,16 +9,19 @@ import requests
 import gzip
 import shutil
 import pickle
-from datetime import datetime
+from datetime import datetime, timezone
 
-print("=== GitHub Actions ASN 数据库自动构建启动 ===")
+print("=== 2025 双栈 ASN 数据库构建启动 ===")
 
 os.makedirs("data", exist_ok=True)
 DB_FILE = "data/ultimate_asn.db"
 
-IPIN_URL = "https://ipin.io/download/export?type=ipv4&format=csv"
+# ==================== 下载源（已支持 IPv6）===================
+IPIN_V4_URL = "https://ipin.io/download/export?type=ipv4&format=csv"
+IPIN_V6_URL = "https://ipin.io/download/export?type=ipv6&format=csv"
 GEOLITE_URL = "https://github.com/P3TERX/GeoLite.mmdb/raw/download/GeoLite2-ASN.mmdb"
-IP2ASN_URL = "https://iptoasn.com/data/ip2asn-combined.tsv.gz"
+IP2ASN_V4_URL = "https://iptoasn.com/data/ip2asn-v4.tsv.gz"
+IP2ASN_V6_URL = "https://iptoasn.com/data/ip2asn-v6.tsv.gz"
 
 def download(url, path):
     if os.path.exists(path):
@@ -29,108 +32,105 @@ def download(url, path):
         r = requests.get(url, timeout=120)
         r.raise_for_status()
         with open(path, "wb") as f:
-            for chunk in r.iter_content(chunk_size=8192):
+            for chunk in r.iter_content(8192):
                 if chunk:
                     f.write(chunk)
-        print(f"下载完成: {path}")
+        print(f"完成: {path}")
     except Exception as e:
-        print(f"下载失败: {url} → {e}")
+        print(f"失败: {url} → {e}")
 
-# 下载三大源
-download(IPIN_URL, "data/ipin.csv.gz")
+# 下载所有文件
+download(IPIN_V4_URL, "data/ipin_v4.csv.gz")
+download(IPIN_V6_URL, "data/ipin_v6.csv.gz")
 download(GEOLITE_URL, "data/GeoLite2-ASN.mmdb")
+download(IP2ASN_V4_URL, "data/ip2asn-v4.tsv.gz")
+download(IP2ASN_V6_URL, "data/ip2asn-v6.tsv.gz")
 
-if not os.path.exists("data/ip2asn.tsv"):
-    gz_path = "data/ip2asn.tsv.gz"
-    download(IP2ASN_URL, gz_path)
-    if os.path.exists(gz_path):
-        print("解压 ip2asn...")
-        with gzip.open(gz_path, 'rb') as f_in:
-            with open("data/ip2asn.tsv", 'wb') as f_out:
+# 解压 TSV
+for gz in ["data/ip2asn-v4.tsv.gz", "data/ip2asn-v6.tsv.gz"]:
+    if os.path.exists(gz):
+        out = gz.replace(".gz", "")
+        if not os.path.exists(out):
+            print(f"解压 {gz}...")
+            with gzip.open(gz, 'rb') as f_in, open(out, 'wb') as f_out:
                 shutil.copyfileobj(f_in, f_out)
-        os.remove(gz_path)
+        os.remove(gz)
 
-# ================================ 融合三大数据库 ================================
-merged = {}
+# ==================== 融合三大源（支持 IPv6）===================
+merged = {}  # key: ip_str (v4/v6) → (asn, org)
 
-# 1. GeoLite2 主力（新版兼容写法）
+# 1. GeoLite2 主力（最准，支持 IPv6）
 try:
     import geoip2.database
-    print("加载 GeoLite2-ASN.mmdb...")
+    print("加载 GeoLite2-ASN.mmdb（支持 IPv6...")
     reader = geoip2.database.Reader("data/GeoLite2-ASN.mmdb")
-    count = 0
-    # 暴力枚举所有 /8 网段的第一个 IP（足够覆盖99.99%记录）
-    for a in range(256):
-        for b in range(256):
-            ip = f"{a}.{b}.0.0"
-            try:
-                resp = reader.asn(ip)
-                if resp.autonomous_system_number:
-                    ip_int = struct.unpack("!I", socket.inet_aton(ip))[0]
-                    merged[ip_int] = (resp.autonomous_system_number,
-                                     resp.autonomous_system_organization or "Unknown")
-                    count += 1
-            except:
-                continue
-    reader.close()
-    print(f"GeoLite2 成功贡献 {count:,} 条记录")
-except Exception as e:
-    print(f"GeoLite2 加载失败（已跳过）: {e}")
-
-# 2. ip2asn 补漏（安全解析）
-print("加载 ip2asn.tsv...")
-try:
-    with open("data/ip2asn.tsv", encoding="utf-8", errors="ignore") as f:
-        for line in f:
-            line = line.strip()
-            if not line or line.startswith("#"):
-                continue
-            parts = line.split("\t")
-            if len(parts) < 5:
-                continue
-            try:
-                start_ip, _, asn = parts[0], parts[1], parts[2]
-                if asn == "0":
-                    continue
-                start_int = int(start_ip)
-                if start_int not in merged:
-                    desc = parts[4].split(",")[0] if len(parts) > 4 else "Unknown"
-                    merged[start_int] = (int(asn), desc)
-            except:
-                continue
-    print(f"ip2asn 补入记录（含去重）")
-except Exception as e:
-    print(f"ip2asn 加载失败: {e}")
-
-# 3. IPin.io 兜底
-try:
-    import pandas as pd
-    print("加载 IPin.io CSV...")
-    df = pd.read_csv("data/ipin.csv.gz", dtype=str, on_bad_lines='skip')
-    for _, row in df.iterrows():
+    # 暴力遍历常见前缀（v4 + v6）
+    prefixes = [
+        "0.0.0.0", "128.0.0.0", "192.0.0.0", "224.0.0.0",
+        "::", "2000::", "2400::", "2600::", "2800::", "2a00::", "2c00::"
+    ]
+    for p in prefixes:
         try:
-            if str(row.get('asn', '')) in ('0', ''):
-                continue
-            start_ip = row['start_ip']
-            start_int = struct.unpack("!I", socket.inet_aton(start_ip))[0]
-            if start_int not in merged:
-                merged[start_int] = (int(row['asn']), row.get('org', 'Unknown'))
+            resp = reader.asn(p)
+            if resp.autonomous_system_number:
+                merged[p] = (resp.autonomous_system_number, resp.autonomous_system_organization or "Unknown")
         except:
             continue
-    print("IPin.io 补入完成")
+    reader.close()
+    print(f"GeoLite2 贡献记录")
 except Exception as e:
-    print(f"IPin.io 加载失败（已跳过）: {e}")
+    print(f"GeoLite2 加载失败: {e}")
 
-# ================================ 生成最终数据库 ================================
-starts = sorted(merged.keys())
-records = [merged[k] for k in starts]
+# 2. ip2asn 补全（v4 + v6）
+print("加载 ip2asn v4 + v6...")
+for file in ["data/ip2asn-v4.tsv", "data/ip2asn-v6.tsv"]:
+    if not os.path.exists(file): continue
+    with open(file, encoding="utf-8", errors="ignore") as f:
+        for line in f:
+            if line.startswith("#"): continue
+            parts = line.strip().split("\t")
+            if len(parts) < 5 or parts[2] == "0": continue
+            start_ip = parts[0]
+            if start_ip not in merged:
+                merged[start_ip] = (int(parts[2]), parts[4].split(",")[0])
 
+# 3. IPin.io 兜底（v4 + v6）
+try:
+    import pandas as pd
+    for file in ["data/ipin_v4.csv.gz", "data/ipin_v6.csv.gz"]:
+        if not os.path.exists(file): continue
+        print(f"加载 {file}...")
+        df = pd.read_csv(file, dtype=str, on_bad_lines='skip')
+        for _, row in df.iterrows():
+            ip = row['start_ip']
+            if ip in merged or row.get('asn', '0') == '0': continue
+            merged[ip] = (int(row['asn']), row.get('org', 'Unknown'))
+except Exception as e:
+    print(f"IPin.io 加载失败: {e}")
+
+# ==================== 生成双栈数据库（支持 IPv4/IPv6 精确查询）===================
+# key: (family, ip_int_or_bytes) → (asn, org)
+final_db = {}
+
+def ip_to_key(ip_str: str):
+    try:
+        if ':' in ip_str:  # IPv6
+            return ('v6', socket.inet_pton(socket.AF_INET6, ip_str))
+        else:  # IPv4
+            return ('v4', struct.unpack(">I", socket.inet_aton(ip_str))[0])
+    except:
+        return None
+
+print("构建双栈精确数据库...")
+for ip_str, (asn, org) in merged.items():
+    key = ip_to_key(ip_str)
+    if key:
+        final_db[key] = (asn, org)
+
+# 保存为 pickle（超快查询）
 with open(DB_FILE, "wb") as f:
-    pickle.dump((starts, records), f)
+    pickle.dump(final_db, f)
 
-print(f"\n终极融合完成！共 {len(merged):,} 条唯一记录")
-print(f"数据库已保存: {DB_FILE}")
+print(f"\n双栈数据库构建完成！共 {len(final_db):,} 条记录（IPv4 + IPv6）")
 print(f"文件大小: {os.path.getsize(DB_FILE)/1024/1024:.1f} MB")
-print(f"构建时间: {datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S')} UTC")
-with open("data/.db_timestamp", "w") as f:
-    f.write(datetime.utcnow().isoformat())
+print(f"构建时间: {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S')} UTC")

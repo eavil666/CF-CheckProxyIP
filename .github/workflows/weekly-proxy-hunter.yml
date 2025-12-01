@@ -84,32 +84,42 @@ jobs:
           GOLD=$(wc -l < golden_300.txt 2>/dev/null || echo 0)
           NEW=$(git diff --numstat proxyip_real_available.txt | awk '{print $1}' || echo 0)
 
-          TEXT="*Cloudflare ProxyIP 狩猎报告*%0A"
-          TEXT+="日期：$(date -u '+%Y-%m-%d %H:%M') UTC%0A"
-          TEXT+="新增：*${NEW}* 条%0A"
-          TEXT+="完整榜单：*${FULL}* 条%0A"
-          TEXT+="精选榜单：*${GOLD}* 条（≤30ms）%0A%0A"
+          # 转义MarkdownV2需要转义的特殊字符，并使用更简单的格式
+          # 切换到HTML格式以避免复杂的转义问题
+          TEXT="<b>Cloudflare ProxyIP 狩猎报告</b>\n"
+          TEXT+="日期：$(date -u '+%Y-%m-%d %H:%M') UTC\n"
+          TEXT+="新增：<b>${NEW}</b> 条\n"
+          TEXT+="完整榜单：<b>${FULL}</b> 条\n"
+          TEXT+="精选榜单：<b>${GOLD}</b> 条（≤30ms）\n\n"
 
           if [ "$GOLD" -gt 1 ]; then
-            TEXT+="最快 Top 5：%0A"
+            TEXT+="最快 Top 5：\n"
             head -5 golden_300.txt | while IFS= read -r line; do
               if [[ $line =~ ^\[?[0-9a-fA-F:.]+ ]]; then
                 ipport=$(echo "$line" | awk '{print $1}')
                 lat=$(echo "$line" | awk '{print $2}')
-                TEXT+="• ${ipport}   ${lat}%0A"
+                TEXT+="• ${ipport}   ${lat}\n"
               fi
             done
           else
-            TEXT+="暂无 ≤30ms 极品%0A"
+            TEXT+="暂无 ≤30ms 极品\n"
           fi
 
-          TEXT+="%0A下载：https://github.com/${GITHUB_REPOSITORY}/releases/latest"
+          TEXT+="\n下载：<a href=\"https://github.com/${GITHUB_REPOSITORY}/releases/latest\">最新发布</a>"
 
+          # 优化curl命令，使用更安全的参数传递方式
           curl -fsS -X POST "https://api.telegram.org/bot$TG_BOT_TOKEN/sendMessage" \
-            -d chat_id="$TG_CHAT_ID" \
-            -d text="$TEXT" \
-            -d parse_mode=Markdown \
-            -d disable_web_page_preview=true || echo "Telegram 发送失败（可能 Token 错误）"
+            --data-urlencode "chat_id=$TG_CHAT_ID" \
+            --data-urlencode "text=$TEXT" \
+            --data-urlencode "parse_mode=HTML" \
+            --data-urlencode "disable_web_page_preview=false" || {
+              echo "Telegram 发送失败（状态码: $?）"
+              # 检查网络连接和API可用性
+              curl -s https://api.telegram.org/bot$TG_BOT_TOKEN/getMe > /dev/null 2>&1
+              if [ $? -ne 0 ]; then
+                echo "错误：无法连接到Telegram API或Token无效"
+              fi
+            }
             
       - name: 检查 Telegram Secrets
         if: always() && (env.TG_BOT_TOKEN == '' || env.TG_CHAT_ID == '')
@@ -117,3 +127,59 @@ jobs:
           TG_BOT_TOKEN: ${{ secrets.TG_BOT_TOKEN }}
           TG_CHAT_ID: ${{ secrets.TG_CHAT_ID }}
         run: echo "警告：Telegram 通知未发送 - 请在仓库 Settings > Secrets 中设置 TG_BOT_TOKEN 和 TG_CHAT_ID"
+        
+      - name: Telegram 连接测试
+        if: always() && env.TG_BOT_TOKEN != '' && env.TG_CHAT_ID != ''
+        env:
+          TG_BOT_TOKEN: ${{ secrets.TG_BOT_TOKEN }}
+          TG_CHAT_ID: ${{ secrets.TG_CHAT_ID }}
+        run: |
+          # 测试Bot Token有效性
+          echo "测试 Telegram Bot Token 有效性..."
+          BOT_INFO=$(curl -s "https://api.telegram.org/bot$TG_BOT_TOKEN/getMe")
+          BOT_OK=$(echo "$BOT_INFO" | grep -o '"ok":true')
+          
+          if [ -z "$BOT_OK" ]; then
+            echo "错误：Telegram Bot Token 无效或已过期"
+            echo "API 返回: $BOT_INFO"
+          else
+            BOT_NAME=$(echo "$BOT_INFO" | grep -o '"username":"[^"]*"' | cut -d':' -f2 | tr -d '"')
+            echo "Bot Token 有效！Bot 名称: $BOT_NAME"
+            
+            # 测试Chat ID有效性（尝试发送一个简单的测试消息）
+            echo "测试 Chat ID 有效性..."
+            TEST_RESULT=$(curl -s -o /dev/null -w "%{http_code}" \
+              -X POST "https://api.telegram.org/bot$TG_BOT_TOKEN/sendMessage" \
+              --data-urlencode "chat_id=$TG_CHAT_ID" \
+              --data-urlencode "text=⚠️ 测试消息：您的工作流配置成功！" \
+              --data-urlencode "parse_mode=HTML")
+            
+            if [ "$TEST_RESULT" -eq 200 ]; then
+              echo "Chat ID 有效！"
+            else
+              echo "错误：Chat ID 无效或Bot无法向该Chat发送消息（状态码: $TEST_RESULT）"
+            fi
+          fi
+
+      - name: 清理旧工作流运行记录（保留5个）
+        if: always()
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          # 使用 GitHub CLI 获取当前工作流的所有运行记录，排除当前运行，并删除旧记录
+          WORKFLOW_ID=$(gh api repos/${GITHUB_REPOSITORY}/actions/workflows --jq ".workflows[] | select(.name==\"Weekly Asia ProxyIP Hunter (2025 Ultimate)\").id")
+          echo "找到工作流 ID: $WORKFLOW_ID"
+          
+          # 获取工作流运行记录，排除当前运行（根据创建时间排序，最新的在前）
+          RUNS_TO_DELETE=$(gh api repos/${GITHUB_REPOSITORY}/actions/workflows/$WORKFLOW_ID/runs --paginate --jq ".workflow_runs[] | select(.id != $GITHUB_RUN_ID) | .id" | sort -nr | tail -n +6)
+          
+          # 如果有超过5个运行记录，则删除旧的
+          if [ ! -z "$RUNS_TO_DELETE" ]; then
+            echo "将删除以下旧工作流运行记录: $RUNS_TO_DELETE"
+            for RUN_ID in $RUNS_TO_DELETE; do
+              echo "删除工作流运行记录: $RUN_ID"
+              gh api repos/${GITHUB_REPOSITORY}/actions/runs/$RUN_ID -X DELETE || echo "删除 $RUN_ID 失败，可能已被删除"
+            done
+          else
+            echo "工作流运行记录数量不超过5个，无需删除"
+          fi
