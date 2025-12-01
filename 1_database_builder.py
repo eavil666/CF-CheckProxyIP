@@ -132,3 +132,5 @@ print(f"\n终极融合完成！共 {len(merged):,} 条唯一记录")
 print(f"数据库已保存: {DB_FILE}")
 print(f"文件大小: {os.path.getsize(DB_FILE)/1024/1024:.1f} MB")
 print(f"构建时间: {datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S')} UTC")
+with open("data/.db_timestamp", "w") as f:
+    f.write(datetime.utcnow().isoformat())
