@@ -1,10 +1,10 @@
 # .github/workflows/weekly-proxy-hunter.yml
-name: Weekly Asia ProxyIP Hunter (Smart & Stable)
+name: Weekly Asia ProxyIP Hunter (终极稳定版)
 
 on:
   schedule:
-    - cron: '0 4 * * 0'        # 每周日 UTC 04:00（北京时间中午12点）
-  workflow_dispatch:           # 支持手动触发
+    - cron: '0 4 * * 0'        # 每周日 UTC 04:00
+  workflow_dispatch:
 
 jobs:
   pipeline:
@@ -15,6 +15,8 @@ jobs:
     steps:
       - name: Checkout Repository
         uses: actions/checkout@v4
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Set up Python 3.11
         uses: actions/setup-python@v5
@@ -26,54 +28,54 @@ jobs:
           python -m pip install --upgrade pip
           pip install geoip2 pandas requests tqdm
 
-      # 智能判断是否需要重建数据库（7天内不重复建）
+      # 智能判断是否需要重建数据库
       - name: Check if ASN DB needs update
         id: check_db
         run: |
           DB_FILE="data/ultimate_asn.db"
           MAX_AGE_DAYS=7
-
           if [ ! -f "$DB_FILE" ]; then
-            echo "数据库不存在 → 需要构建"
             echo "need_build=true" >> $GITHUB_OUTPUT
           else
-            file_time=$(git log -1 --format="%at" -- "$DB_FILE" 2>/dev/null || date +%s)
+            file_time=$(git log -1 --format="%at" -- "$DB_FILE" 2>/dev/null || stat -c %Y "$DB_FILE")
             current_time=$(date +%s)
-            age_days=$(( (current_time - file_time) / 86400 ))
-            echo "数据库年龄：$age_days 天"
-            if [ $age_days -gt $MAX_AGE_DAYS ]; then
-              echo "超过 $MAX_AGE_DAYS 天 → 需要更新"
-              echo "need_build=true" >> $GITHUB_OUTPUT
-            else
-              echo "仅 $age_days 天 → 跳过构建"
-              echo "need_build=false" >> $GITHUB_OUTPUT
-            fi
+            age_days=$(((current_time - file_time) / 86400))
+            [ $age_days -gt $MAX_AGE_DAYS ] && echo "need_build=true" >> $GITHUB_OUTPUT || echo "need_build=false" >> $GITHUB_OUTPUT
           fi
 
-      # 只有需要时才构建数据库
       - name: Build Ultimate ASN Database
         if: steps.check_db.outputs.need_build == 'true'
         timeout-minutes: 25
         run: python 1_database_builder.py
 
-      # 始终运行扫描器（用最新数据库）
-      - name: Run Asia ProxyIP Scanner
+      - name: Run ProxyIP Scanner
         timeout-minutes: 40
         run: python 2_proxy_scanner.py
 
-      # 安全提交（优化了 awk 和日期格式）
+      # 终极稳定提交逻辑（修复所有路径问题）
       - name: Commit & Push Results
         run: |
           git config --global user.name "GitHub Action Hunter"
           git config --global user.email "action@github.com"
-          
+          git config --global init.defaultBranch main
+
+          # 确保文件存在（防止 add 失败）
+          touch data/ultimate_asn.db proxyip_real_available.txt 2>/dev/null || true
+
           git add data/ultimate_asn.db proxyip_real_available.txt
-          
-          if git diff --quiet --staged; then
-            echo "🎉 没有变化，本周收手！"
-          else
-            NEW_COUNT=$(git diff --staged --numstat | awk '{sum+=$1+$2} END {print sum}' || echo "0")
-            git commit -m "Weekly hunt: +${NEW_COUNT} new real ProxyIP - $(date -u '+%Y-%m-%d %H:%M') UTC"
-            git push origin main
-            echo "🚀 已提交 ${NEW_COUNT} 条新极品！"
+
+          # 检查是否有实际变更
+          if git diff --cached --quiet; then
+            echo "没有文件变更，本周无新收获"
+            exit 0
           fi
+
+          # 统计新增行数（更准确）
+          added_lines=$(git diff --cached --numstat | awk '{print $1}' | paste -sd+ - | bc || echo 0)
+
+          git commit -m "Weekly hunt: +${added_lines} new real ProxyIP - $(date -u '+%Y-%m-%d %H:%M') UTC"
+          
+          # 强制推送到 main（解决权限问题）
+          git push origin HEAD:main
+
+          echo "提交成功！新增 ${added_lines} 条真实可用 ProxyIP！"
