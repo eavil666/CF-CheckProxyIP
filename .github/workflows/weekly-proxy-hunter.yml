@@ -1,13 +1,19 @@
 # .github/workflows/weekly-proxy-hunter.yml
-name: Weekly Asia ProxyIP Hunter (Smart Skip)
+name: Weekly Asia ProxyIP Hunter (Smart & Stable)
 
 on:
   schedule:
-    - cron: '0 4 * * 0'        # 每周日 UTC 04:00
-  workflow_dispatch:
+    - cron: '0 4 * * 0'        # 每周日 UTC 04:00（北京时间中午12点）
+  workflow_dispatch:           # 支持手动触发
 
 jobs:
-  smart-pipeline:
+  # 允许从 fork 仓库运行（方便测试）
+  workflow_run:
+    workflows: ["Weekly Asia ProxyIP Hunter (Smart & Stable)"]
+    types: [requested]
+
+jobs:
+  pipeline:
     runs-on: ubuntu-latest
     permissions:
       contents: write
@@ -16,7 +22,7 @@ jobs:
       - name: Checkout Repository
         uses: actions/checkout@v4
 
-      - name: Set up Python
+      - name: Set up Python 3.11
         uses: actions/setup-python@v5
         with:
           python-version: '3.11'
@@ -26,54 +32,54 @@ jobs:
           python -m pip install --upgrade pip
           pip install geoip2 pandas requests tqdm
 
-      # 智能判断：数据库是否需要更新？
+      # 智能判断是否需要重建数据库（7天内不重复建）
       - name: Check if ASN DB needs update
         id: check_db
         run: |
           DB_FILE="data/ultimate_asn.db"
-          MAX_AGE_DAYS=7  # 7 天内不重建
+          MAX_AGE_DAYS=7
 
           if [ ! -f "$DB_FILE" ]; then
-            echo "数据库不存在 → 不存在，需要构建"
+            echo "数据库不存在 → 需要构建"
             echo "need_build=true" >> $GITHUB_OUTPUT
           else
-            # 获取文件修改时间（UTC）
-            file_time=$(stat -c %Y "$DB_FILE" 2>/dev/null || git log -1 --format="%at" -- "$DB_FILE")
+            file_time=$(git log -1 --format="%at" -- "$DB_FILE" 2>/dev/null || date +%s)
             current_time=$(date +%s)
             age_days=$(( (current_time - file_time) / 86400 ))
             echo "数据库年龄：$age_days 天"
             if [ $age_days -gt $MAX_AGE_DAYS ]; then
-              echo "数据库超过 $MAX_AGE_DAYS 天 → 需要更新"
+              echo "超过 $MAX_AGE_DAYS 天 → 需要更新"
               echo "need_build=true" >> $GITHUB_OUTPUT
             else
-              echo "数据库仅 $age_days 天 → 跳过构建"
+              echo "仅 $age_days 天 → 跳过构建"
               echo "need_build=false" >> $GITHUB_OUTPUT
             fi
           fi
 
       # 只有需要时才构建数据库
-      - name: Build Ultimate ASN Database (Conditional)
+      - name: Build Ultimate ASN Database
         if: steps.check_db.outputs.need_build == 'true'
         timeout-minutes: 25
         run: python 1_database_builder.py
 
-      # 无论如何都运行扫描器（用最新的数据库）
+      # 始终运行扫描器（用最新数据库）
       - name: Run Asia ProxyIP Scanner
         timeout-minutes: 40
         run: python 2_proxy_scanner.py
 
-      # 提交结果（数据库 + 扫描结果）
+  
       - name: Commit & Push Results
         run: |
-          git config user.name "GitHub Action Hunter"
-          git config user.email "action@github.com
+          git config --global user.name "GitHub Action Hunter"
+          git config --global user.email "action@github.com"
           
-          git add data/ultimate_asn.db proxyip_asia_final.txt
+          git add data/ultimate_asn.db proxyip_real_available.txt
           
           if git diff --quiet --staged; then
-            echo "没有变化，本周收手"
+            echo "🎉 没有变化，本周收手！"
           else
-            git commit -m"Weekly update: $(git diff --shortstat --staged) - $(date -u +'%Y-%m-%d %H:%M') UTC"
-            git push
-            echo "已提交更新！"
+            NEW_COUNT=$(git diff --staged --numstat | awk '{print $1+$2}' | paste -sd+ - | bc)
+            git commit -m "Weekly hunt: +${NEW_COUNT:-?} new real ProxyIP - $(date -u '+%Y-%m-%d %H:%M') UTC"
+            git push origin main
+            echo "🚀 已提交 ${NEW_COUNT:-?} 条新极品！"
           fi
