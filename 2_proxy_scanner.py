@@ -24,17 +24,19 @@ ASIA_CIDRS = [
 ]
 
 # 读取历史缓存
+# 把这几行替换掉原来的缓存读取部分
 success_cache = set()
 if os.path.exists(RESULT_FILE):
     try:
         with open(RESULT_FILE, encoding="utf-8") as f:
             for line in f:
                 line = line.strip()
-                if ":" in line and line[0].isdigit():
-                    success_cache.add(line.split()[0])
-        print(f"已加载 {len(success_cache)} 条历史成功记录")
-    except Exception as e:
-        print(f"读取缓存失败: {e}")
+                if ":" in line:
+                    ip = line.split(":")[0]  # 只缓存 IP
+                    success_cache.add(ip)
+        print(f"已加载 {len(success_cache)} 个已成功IP（仅IP级缓存）")
+    except:
+        print("读取缓存失败")
 
 #  ================================ 终极真实验证函数 ================================
 async def is_real_proxy(ip: str, port: int = 443) -> tuple[bool, str, float]:
