@@ -1,22 +1,22 @@
 # .github/workflows/weekly-proxy-hunter.yml
-name: Weekly ProxyIP Hunter + Release + Telegram
+name: Weekly Asia ProxyIP Hunter (2025 Ultimate)
 
 on:
   schedule:
     - cron: '0 4 * * 0'        # 每周日 UTC 04:00（北京中午12点）
-  workflow_dispatch:
+  workflow_dispatch:           # 手动触发
 
 jobs:
   hunt-and-release:
     runs-on: ubuntu-latest
     permissions:
-      contents: write
+      contents: write           # 允许写 Release
 
     steps:
-      - name: Checkout
+      - name: Checkout Repository
         uses: actions/checkout@v4
 
-      - name: Set up Python
+      - name: Setup Python 3.11
         uses: actions/setup-python@v5
         with:
           python-version: '3.11'
@@ -34,46 +34,86 @@ jobs:
 
       - name: Generate Golden List (≤30ms Top 300)
         run: |
-          if [ ! -f proxyip_real_available.txt ]; then
-            echo "无结果，跳过精选榜单"
-            exit 0
+          # 确保文件存在
+          touch proxyip_real_available.txt golden_300.txt
+          
+          # 生成精选榜单
+          if grep -q "ms" proxyip_real_available.txt 2>/dev/null; then
+            grep -E ' ([0-9]{1,2}|30)ms ' proxyip_real_available.txt | \
+              sort -k2 -n | head -300 > golden_300.txt
           fi
-          grep -E " [0-9]{1,2}ms | [0-2][0-9]ms " proxyip_real_available.txt | \
-            sort -n -k2 | head -300 > golden_300.txt
-          echo "生成 golden_300.txt（$(wc -l < golden_300.txt) 条）"
+          
+          # 如果精选榜单为空，写个说明
+          if [ ! -s golden_300.txt ]; then
+            echo "# 暂无 ≤30ms 可用 IP" > golden_300.txt
+          fi
 
-      - name: Create Release + Upload Files
-        if: success() && env.NEW_COUNT != '0'
+      - name: Create Release + Upload
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          NEW_COUNT: $(git diff --numstat proxyip_real_available.txt | awk '{print $1}' || echo 0)
         run: |
           TAG="golden-$(date +'%Y%m%d')"
-          TITLE="2025 黄金精选榜单（Top 300，≤30ms）+${{ env.NEW_COUNT }} 新增"
-          
+          FULL_COUNT=$(wc -l < proxyip_real_available.txt 2>/dev/null || echo 0)
+          GOLDEN_COUNT=$(wc -l < golden_300.txt 2>/dev/null || echo 0)
+          NEW_COUNT=$(git diff --numstat proxyip_real_available.txt | awk '{print $1}' || echo 0)
+
+          # 至少有一个文件有内容才发 Release
+          if [ "$FULL_COUNT" -eq 0 ] && [ "$GOLDEN_COUNT" -le 1 ]; then
+            echo "无新内容，跳过 Release"
+            exit 0
+          fi
+
+          # 创建 Release（如果已存在会自动跳过）
           gh release create "$TAG" \
-            golden_300.txt proxyip_real_available.txt \
-            --title "$TITLE" \
-            --notes "自动狩猎完成！本次新增 ${{ env.NEW_COUNT }} 条真实可用 ProxyIP"
+            --title "2025 黄金榜单（Top 300 ≤30ms）+${NEW_COUNT} 新增" \
+            --notes "自动狩猎完成！完整 ${FULL_COUNT} 条，精选 ${GOLDEN_COUNT} 条（≤30ms）"
 
-      - name: Telegram 推送通知
-        if: always()
+          # 安全上传（只上传存在的非空文件）
+          [ -s proxyip_real_available.txt ] && gh release upload "$TAG" proxyip_real_available.txt --clobber
+          [ -s golden_300.txt ] && gh release upload "$TAG" golden_300.txt --clobber
+
+          echo "Release 创建成功！https://github.com/${GITHUB_REPOSITORY}/releases/tag/$TAG"
+
+      - name: Telegram 推送
+        if: always() && env.TG_BOT_TOKEN != '' && env.TG_CHAT_ID != ''
+        env:
+          TG_BOT_TOKEN: ${{ secrets.TG_BOT_TOKEN }}
+          TG_CHAT_ID: ${{ secrets.TG_CHAT_ID }}
         run: |
+          FULL=$(wc -l < proxyip_real_available.txt 2>/dev/null || echo 0)
+          GOLD=$(wc -l < golden_300.txt 2>/dev/null || echo 0)
           NEW=$(git diff --numstat proxyip_real_available.txt | awk '{print $1}' || echo 0)
-          GOLDEN=$(wc -l < golden_300.txt 2>/dev/null || echo 0)
-          
-          TEXT="🚀 *Cloudflare ProxyIP 狩猎报告* %0A"
-          TEXT+="日期：$(date -u '+%Y-%m-%d %H:%M') UTC %0A"
-          TEXT+="本次新增：*${NEW}* 条 %0A"
-          TEXT+="精选榜单：*${GOLDEN}* 条（≤30ms） %0A%0A"
-          TEXT+="🔥 最快 Top 5：%0A"
-          head -5 golden_300.txt | while read line; do
-            TEXT+="$(echo $line | cut -d' ' -f1)   $(echo $line | cut -d' ' -f2)%0A"
-          done
-          TEXT+="%0A下载地址：https://github.com/$GITHUB_REPOSITORY/releases/latest"
 
-          curl -s -X POST "https://api.telegram.org/bot${{ secrets.TG_BOT_TOKEN }}/sendMessage" \
-            -d chat_id=${{ secrets.TG_CHAT_ID }} \
+          TEXT="*Cloudflare ProxyIP 狩猎报告*%0A"
+          TEXT+="日期：$(date -u '+%Y-%m-%d %H:%M') UTC%0A"
+          TEXT+="新增：*${NEW}* 条%0A"
+          TEXT+="完整榜单：*${FULL}* 条%0A"
+          TEXT+="精选榜单：*${GOLD}* 条（≤30ms）%0A%0A"
+
+          if [ "$GOLD" -gt 1 ]; then
+            TEXT+="最快 Top 5：%0A"
+            head -5 golden_300.txt | while IFS= read -r line; do
+              if [[ $line =~ ^\[?[0-9a-fA-F:.]+ ]]; then
+                ipport=$(echo "$line" | awk '{print $1}')
+                lat=$(echo "$line" | awk '{print $2}')
+                TEXT+="• ${ipport}   ${lat}%0A"
+              fi
+            done
+          else
+            TEXT+="暂无 ≤30ms 极品%0A"
+          fi
+
+          TEXT+="%0A下载：https://github.com/${GITHUB_REPOSITORY}/releases/latest"
+
+          curl -fsS -X POST "https://api.telegram.org/bot$TG_BOT_TOKEN/sendMessage" \
+            -d chat_id="$TG_CHAT_ID" \
             -d text="$TEXT" \
             -d parse_mode=Markdown \
-            -d disable_web_page_preview=true
+            -d disable_web_page_preview=true || echo "Telegram 发送失败（可能 Token 错误）"
+            
+      - name: 检查 Telegram Secrets
+        if: always() && (env.TG_BOT_TOKEN == '' || env.TG_CHAT_ID == '')
+        env:
+          TG_BOT_TOKEN: ${{ secrets.TG_BOT_TOKEN }}
+          TG_CHAT_ID: ${{ secrets.TG_CHAT_ID }}
+        run: echo "警告：Telegram 通知未发送 - 请在仓库 Settings > Secrets 中设置 TG_BOT_TOKEN 和 TG_CHAT_ID"
