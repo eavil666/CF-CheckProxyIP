@@ -1,24 +1,22 @@
 # .github/workflows/weekly-proxy-hunter.yml
-name: Weekly Asia ProxyIP Hunter (终极稳定版)
+name: Weekly ProxyIP Hunter + Release + Telegram
 
 on:
   schedule:
-    - cron: '0 4 * * 0'        # 每周日 UTC 04:00
+    - cron: '0 4 * * 0'        # 每周日 UTC 04:00（北京中午12点）
   workflow_dispatch:
 
 jobs:
-  pipeline:
+  hunt-and-release:
     runs-on: ubuntu-latest
     permissions:
       contents: write
 
     steps:
-      - name: Checkout Repository
+      - name: Checkout
         uses: actions/checkout@v4
-        with:
-          token: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Set up Python 3.11
+      - name: Set up Python
         uses: actions/setup-python@v5
         with:
           python-version: '3.11'
@@ -28,54 +26,54 @@ jobs:
           python -m pip install --upgrade pip
           pip install geoip2 pandas requests tqdm
 
-      # 智能判断是否需要重建数据库
-      - name: Check if ASN DB needs update
-        id: check_db
-        run: |
-          DB_FILE="data/ultimate_asn.db"
-          MAX_AGE_DAYS=7
-          if [ ! -f "$DB_FILE" ]; then
-            echo "need_build=true" >> $GITHUB_OUTPUT
-          else
-            file_time=$(git log -1 --format="%at" -- "$DB_FILE" 2>/dev/null || stat -c %Y "$DB_FILE")
-            current_time=$(date +%s)
-            age_days=$(((current_time - file_time) / 86400))
-            [ $age_days -gt $MAX_AGE_DAYS ] && echo "need_build=true" >> $GITHUB_OUTPUT || echo "need_build=false" >> $GITHUB_OUTPUT
-          fi
-
-      - name: Build Ultimate ASN Database
-        if: steps.check_db.outputs.need_build == 'true'
-        timeout-minutes: 25
+      - name: Build ASN Database
         run: python 1_database_builder.py
 
-      - name: Run ProxyIP Scanner
-        timeout-minutes: 40
+      - name: Run Scanner
         run: python 2_proxy_scanner.py
 
-      # 终极稳定提交逻辑（修复所有路径问题）
-      - name: Commit & Push Results
+      - name: Generate Golden List (≤30ms Top 300)
         run: |
-          git config --global user.name "GitHub Action Hunter"
-          git config --global user.email "action@github.com"
-          git config --global init.defaultBranch main
-
-          # 确保文件存在（防止 add 失败）
-          touch data/ultimate_asn.db proxyip_real_available.txt 2>/dev/null || true
-
-          git add data/ultimate_asn.db proxyip_real_available.txt
-
-          # 检查是否有实际变更
-          if git diff --cached --quiet; then
-            echo "没有文件变更，本周无新收获"
+          if [ ! -f proxyip_real_available.txt ]; then
+            echo "无结果，跳过精选榜单"
             exit 0
           fi
+          grep -E " [0-9]{1,2}ms | [0-2][0-9]ms " proxyip_real_available.txt | \
+            sort -n -k2 | head -300 > golden_300.txt
+          echo "生成 golden_300.txt（$(wc -l < golden_300.txt) 条）"
 
-          # 统计新增行数（更准确）
-          added_lines=$(git diff --cached --numstat | awk '{print $1}' | paste -sd+ - | bc || echo 0)
-
-          git commit -m "Weekly hunt: +${added_lines} new real ProxyIP - $(date -u '+%Y-%m-%d %H:%M') UTC"
+      - name: Create Release + Upload Files
+        if: success() && env.NEW_COUNT != '0'
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          NEW_COUNT: $(git diff --numstat proxyip_real_available.txt | awk '{print $1}' || echo 0)
+        run: |
+          TAG="golden-$(date +'%Y%m%d')"
+          TITLE="2025 黄金精选榜单（Top 300，≤30ms）+${{ env.NEW_COUNT }} 新增"
           
-          # 强制推送到 main（解决权限问题）
-          git push origin HEAD:main
+          gh release create "$TAG" \
+            golden_300.txt proxyip_real_available.txt \
+            --title "$TITLE" \
+            --notes "自动狩猎完成！本次新增 ${{ env.NEW_COUNT }} 条真实可用 ProxyIP"
 
-          echo "提交成功！新增 ${added_lines} 条真实可用 ProxyIP！"
+      - name: Telegram 推送通知
+        if: always()
+        run: |
+          NEW=$(git diff --numstat proxyip_real_available.txt | awk '{print $1}' || echo 0)
+          GOLDEN=$(wc -l < golden_300.txt 2>/dev/null || echo 0)
+          
+          TEXT="🚀 *Cloudflare ProxyIP 狩猎报告* %0A"
+          TEXT+="日期：$(date -u '+%Y-%m-%d %H:%M') UTC %0A"
+          TEXT+="本次新增：*${NEW}* 条 %0A"
+          TEXT+="精选榜单：*${GOLDEN}* 条（≤30ms） %0A%0A"
+          TEXT+="🔥 最快 Top 5：%0A"
+          head -5 golden_300.txt | while read line; do
+            TEXT+="$(echo $line | cut -d' ' -f1)   $(echo $line | cut -d' ' -f2)%0A"
+          done
+          TEXT+="%0A下载地址：https://github.com/$GITHUB_REPOSITORY/releases/latest"
+
+          curl -s -X POST "https://api.telegram.org/bot${{ secrets.TG_BOT_TOKEN }}/sendMessage" \
+            -d chat_id=${{ secrets.TG_CHAT_ID }} \
+            -d text="$TEXT" \
+            -d parse_mode=Markdown \
+            -d disable_web_page_preview=true
