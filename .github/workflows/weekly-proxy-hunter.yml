@@ -7,12 +7,6 @@ on:
   workflow_dispatch:           # 支持手动触发
 
 jobs:
-  # 允许从 fork 仓库运行（方便测试）
-  workflow_run:
-    workflows: ["Weekly Asia ProxyIP Hunter (Smart & Stable)"]
-    types: [requested]
-
-jobs:
   pipeline:
     runs-on: ubuntu-latest
     permissions:
@@ -67,7 +61,7 @@ jobs:
         timeout-minutes: 40
         run: python 2_proxy_scanner.py
 
-  
+      # 安全提交（优化了 awk 和日期格式）
       - name: Commit & Push Results
         run: |
           git config --global user.name "GitHub Action Hunter"
@@ -78,8 +72,8 @@ jobs:
           if git diff --quiet --staged; then
             echo "🎉 没有变化，本周收手！"
           else
-            NEW_COUNT=$(git diff --staged --numstat | awk '{print $1+$2}' | paste -sd+ - | bc)
-            git commit -m "Weekly hunt: +${NEW_COUNT:-?} new real ProxyIP - $(date -u '+%Y-%m-%d %H:%M') UTC"
+            NEW_COUNT=$(git diff --staged --numstat | awk '{sum+=$1+$2} END {print sum}' || echo "0")
+            git commit -m "Weekly hunt: +${NEW_COUNT} new real ProxyIP - $(date -u '+%Y-%m-%d %H:%M') UTC"
             git push origin main
-            echo "🚀 已提交 ${NEW_COUNT:-?} 条新极品！"
+            echo "🚀 已提交 ${NEW_COUNT} 条新极品！"
           fi
